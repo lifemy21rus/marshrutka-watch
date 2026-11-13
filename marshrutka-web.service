@@ -1,0 +1,24 @@
+[Unit]
+Description=Marshrutka watch — веб-панель настроек
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=marshrutka
+Group=marshrutka
+WorkingDirectory=/opt/marshrutka-watch
+ExecStart=/usr/bin/python3 /opt/marshrutka-watch/webconfig.py --config /opt/marshrutka-watch/config.json --auth /opt/marshrutka-watch/web_auth.json --bind 127.0.0.1 --port 8080
+Restart=always
+RestartSec=5
+Environment=TZ=Europe/Moscow
+Environment=PYTHONUNBUFFERED=1
+
+# Безопасность
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

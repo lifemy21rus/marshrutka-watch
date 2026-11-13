@@ -1,0 +1,31 @@
+{
+  "region_id": "45",
+  "city": "cheboksary",
+  "stop_id": "stop__10094747",
+  "routes": [
+    "5"
+  ],
+  "ntfy_server": "https://ntfy.sh",
+  "ntfy_topic": "marshrutka-cheboksary-5-ЗАМЕНИТЕ-на-случайную-строку",
+  "ntfy_token": "",
+  "interval": 60,
+  "window_from": "05:30",
+  "window_to": "10:00",
+  "notify_at": [
+    15,
+    10,
+    5,
+    2
+  ],
+  "notify_repeat_minutes": 1,
+  "notify_mode": "repeat",
+  "walk_minutes": 5,
+  "route_settings": {},
+  "window_by_weekday": {},
+  "side_min_back_m": 700.0,
+  "default_speed_mps": 8.0,
+  "match_tolerance_min": 4.0,
+  "geo_ttl": 1800,
+  "timeout": 30,
+  "weekdays_only": false
+}

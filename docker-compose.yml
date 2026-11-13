@@ -1,0 +1,11 @@
+services:
+  marshrutka-watch:
+    build: .
+    container_name: marshrutka-watch
+    restart: unless-stopped
+    environment:
+      - PYTHONUNBUFFERED=1
+      - TZ=Europe/Moscow
+    volumes:
+      - ./config.json:/app/config.json:ro
+    command: ["python3", "/app/marshrutka_watch.py", "--config", "/app/config.json"]

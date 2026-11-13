@@ -1,0 +1,25 @@
+[Unit]
+Description=Трекер маршрутки с push-уведомлениями (ntfy)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=marshrutka
+Group=marshrutka
+WorkingDirectory=/opt/marshrutka-watch
+ExecStart=/usr/bin/python3 /opt/marshrutka-watch/marshrutka_watch.py --config /opt/marshrutka-watch/config.json
+Restart=always
+RestartSec=30
+Environment=TZ=Europe/Moscow
+Environment=PYTHONUNBUFFERED=1
+
+# Безопасность
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadOnlyPaths=/opt/marshrutka-watch
+
+[Install]
+WantedBy=multi-user.target

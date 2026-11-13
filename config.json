@@ -1,0 +1,35 @@
+﻿{
+  "region_id": "45",
+  "city": "cheboksary",
+  "stop_id": "stop__10094747",
+  "routes": [
+    "5"
+  ],
+
+  "ntfy_server": "https://ntfy.sh",
+  "ntfy_topic": "mdw-5678401c7502",
+  "ntfy_token": "",
+
+  "interval": 60,
+  "window_from": "08:30",
+  "window_to": "09:10",
+  "window_by_weekday": {},
+  "notify_at": [
+    20,
+    15,
+    10,
+    5
+  ],
+  "notify_repeat_minutes": 1,
+  "notify_mode": "repeat",
+  "walk_minutes": 5,
+  "route_settings": {},
+
+  "side_min_back_m": 700.0,
+  "default_speed_mps": 8.0,
+  "match_tolerance_min": 4.0,
+  "geo_ttl": 1800,
+  "timeout": 30,
+  "weekdays_only": true,
+  "snapshot_path": "/var/lib/marshrutka-watch/last_arrivals.json"
+}
