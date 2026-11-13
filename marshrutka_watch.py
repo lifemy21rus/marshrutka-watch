@@ -482,6 +482,9 @@ class Tracker:
         self._veh_hist: Dict[str, List[Tuple[float, float, float]]] = {}
         # последний удачный прогноз: запасной источник, если Яндекс не отвечает
         self._last_arrivals: List[Arrival] = []
+        # запомненное направление по рейсу: если однажды определили уверенно,
+        # не теряем его при временной потере live-сопоставления
+        self._known_dir: Dict[str, Dict[str, Any]] = {}
         self.last_error: Optional[str] = None
 
     # -- остановка: прогноз прибытия --------------------------------------
@@ -706,10 +709,16 @@ class Tracker:
                 self._apply_branch(a, best_v, branch_labels, live=True)
                 used_v.add(best_vid)
 
-            # направление не определено уверенно — оставляем время, но не угадываем
+            # направление не определено уверенно — пробуем восстановить ранее известное для этого рейса
             for a in arrs:
-                if not (a.dest and a.dest.startswith("в сторону ")):
+                if a.dest and a.dest.startswith("в сторону "):
+                    self._remember_direction(a)
+                elif not self._restore_direction(a):
                     self._clear_direction([a])
+                else:
+                    # нормализуем мусорные поля, но сохраняем восстановленное направление
+                    if a.side and not a.side.startswith("со стороны "):
+                        a.side = ""
         return arrivals
 
     def _apply_branch(self, arrival: Arrival, veh_info: Dict[str, Any],
@@ -721,6 +730,91 @@ class Tracker:
         if live:
             arrival.origin = "yandex+geo"
             arrival.live = True
+
+    def _remember_direction(self, arrival: Arrival) -> None:
+        if not (arrival.dest and arrival.dest.startswith("в сторону ")):
+            return
+        now = time.time()
+        dir_key = (arrival.dest, arrival.side or "", arrival.next_stop or "")
+        keys = self._dir_keys(arrival)
+        for k in keys:
+            item = self._known_dir.get(k)
+            if not item:
+                item = {"route": arrival.route, "ts": arrival.ts, "seen": now, "counts": {}}
+                self._known_dir[k] = item
+            counts = item.setdefault("counts", {})
+            # миграция со старого формата (одиночное направление)
+            if not counts and item.get("dest"):
+                old_key = (item.get("dest"), item.get("side") or "", item.get("next_stop") or "")
+                counts[old_key] = int(item.get("count") or 1)
+            counts[dir_key] = int(counts.get(dir_key, 0)) + 1
+            item["route"] = arrival.route
+            item["ts"] = arrival.ts
+            item["seen"] = now
+        # чистим устаревшие записи
+        stale_before = now - 3600
+        for k, v in list(self._known_dir.items()):
+            if float(v.get("seen") or 0) < stale_before:
+                self._known_dir.pop(k, None)
+
+    def _dir_keys(self, arrival: Arrival) -> List[str]:
+        keys = []
+        if arrival.vehicle_id:
+            keys.append("vid:%s:%s" % (arrival.route, arrival.vehicle_id))
+        # запасной ключ по маршруту и расчётному времени прибытия (допуск на "плавание" ETA)
+        keys.append("ts:%s:%s" % (arrival.route, int(round(arrival.ts / 60.0))))
+        return keys
+
+    def _pick_majority_direction(self, item: Dict[str, Any]) -> Optional[Tuple[str, str, str]]:
+        counts = item.get("counts") or {}
+        if not counts and item.get("dest"):
+            return (item.get("dest"), item.get("side") or "", item.get("next_stop") or "")
+        if not counts:
+            return None
+        # направление, которое встречалось чаще всего; при равенстве — более свежее по ts контекста не храним отдельно,
+        # поэтому оставляем детерминированный выбор
+        best = max(counts.items(), key=lambda kv: (int(kv[1]), kv[0][0]))
+        d, s, n = best[0]
+        if not d:
+            return None
+        return (d, s, n)
+
+    def _restore_direction(self, arrival: Arrival) -> bool:
+        if arrival.dest and arrival.dest.startswith("в сторону "):
+            return True
+        candidates = []
+        for k in self._dir_keys(arrival):
+            item = self._known_dir.get(k)
+            if not item:
+                continue
+            if abs(int(item.get("ts") or 0) - int(arrival.ts)) > 20 * 60:
+                continue
+            pick = self._pick_majority_direction(item)
+            if pick:
+                counts = item.get("counts") or {}
+                score = int(counts.get(pick, 1)) if counts else 1
+                candidates.append((score, pick))
+        if not candidates:
+            # дополнительный поиск: тот же маршрут и близкое время прибытия
+            for item in self._known_dir.values():
+                if item.get("route") != arrival.route:
+                    continue
+                if abs(int(item.get("ts") or 0) - int(arrival.ts)) <= 6 * 60:
+                    pick = self._pick_majority_direction(item)
+                    if pick:
+                        counts = item.get("counts") or {}
+                        score = int(counts.get(pick, 1)) if counts else 1
+                        candidates.append((score, pick))
+        if not candidates:
+            return False
+        # выбираем направление с наибольшим числом наблюдений среди подходящих записей
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        dest, side, next_stop = candidates[0][1]
+        arrival.side = arrival.side or side or ""
+        arrival.dest = dest or arrival.dest
+        if not arrival.next_stop:
+            arrival.next_stop = next_stop
+        return bool(arrival.dest)
 
     def _clear_direction(self, arrivals: List[Arrival]) -> None:
         for a in arrivals:
@@ -876,7 +970,9 @@ class Tracker:
                     a.live = False
                 return cached
             raise
-        arrivals = [a for a in arrivals if a.ts > time.time() - 120]
+        # оставляем немного "просроченные" прибытия: маршрутка может опаздывать,
+        # но ещё ехать к остановке (иначе запись исчезает слишком рано)
+        arrivals = [a for a in arrivals if a.ts > time.time() - 10 * 60]
         self._last_arrivals = list(arrivals)
         self.last_error = None
         return arrivals
