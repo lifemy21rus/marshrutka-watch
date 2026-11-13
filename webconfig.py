@@ -158,11 +158,14 @@ def validate(form: Dict[str, str]) -> Tuple[Dict[str, Any], List[str]]:
     try:
         thresholds = sorted({int(x) for x in re.split(r"[,\s;]+", raw) if x}, reverse=True)
     except ValueError:
-        errors.append("Пороги должны быть целыми числами минут")
+        errors.append("Время должно быть целым числом минут")
     if not thresholds:
-        errors.append("Укажите хотя бы один порог, например 20,10,5")
+        errors.append("Укажите, за сколько минут до приезда уведомлять (например, 10)")
     elif any(v < 0 or v > 180 for v in thresholds):
-        errors.append("Пороги должны быть от 0 до 180 минут")
+        errors.append("Значение должно быть от 0 до 180 минут")
+    # для текущего простого режима используем одно значение (первое/максимальное)
+    if thresholds:
+        thresholds = [max(thresholds)]
 
     try:
         walk = int(form.get("walk_minutes") or 0)
@@ -185,9 +188,13 @@ def validate(form: Dict[str, str]) -> Tuple[Dict[str, Any], List[str]]:
     if not (1 <= repeat <= 60):
         errors.append("Частота повторов — число от 1 до 60 минут (1 = каждую минуту)")
 
-    notify_mode = (form.get("notify_mode") or "repeat").strip().lower()
-    if notify_mode not in ("repeat", "once"):
-        errors.append("Режим уведомлений: выберите «повторять» или «один раз на порог»")
+    notify_mode = (form.get("notify_mode") or "every").strip().lower()
+    if notify_mode in ("lead", "once", "advance"):
+        notify_mode = "lead"
+    elif notify_mode in ("every", "repeat", "periodic"):
+        notify_mode = "every"
+    else:
+        errors.append("Режим уведомлений: выберите «за N минут до приезда» или «каждые N минут»")
 
     route_settings = {}
     raw_rs = (form.get("route_settings") or "").strip()
@@ -343,8 +350,11 @@ def _fetch_forecast(config_path: str) -> None:
                 "mins": max(0, int(round(a.minutes))),
                 "side": a.side or "",
                 "dest": a.dest or "",
+                "travel_dir": a.dest or "",
+                "from_side": a.side or "",
+                "direction_known": bool(a.dest),
                 "live": bool(a.live),
-                "source": "прогноз" if a.source == "Estimated" else "расписание",
+                "source": "в эфире" if a.live else "прогноз Яндекса",
             })
     except Exception as exc:  # noqa: BLE001
         error = str(exc)
@@ -444,9 +454,17 @@ def render_forecast(fc: Dict[str, Any]) -> str:
         for r in fc["rows"]:
             bits = ['<span class="mins">%s</span>' % esc(r["mins"]),
                     '<span class="when">в %s</span>' % esc(r["when"])]
-            detail = " · ".join(x for x in (r["side"], r["dest"]) if x)
-            source = esc(r.get("source") or "") if r.get("live", True) else (
-                '<span class="muted-src">%s, без GPS</span>' % esc(r.get("source") or ""))
+            direction = r.get("travel_dir") or r.get("dest") or "направление уточняется"
+            from_side = r.get("from_side") or r.get("side") or ""
+            detail = " · ".join(x for x in (direction, from_side) if x)
+            src_raw = r.get("source") or ""
+            if r.get("live", True):
+                source = esc(src_raw or "в эфире")
+            else:
+                label = src_raw or "прогноз Яндекса"
+                if "без GPS" not in label:
+                    label = "%s, без GPS" % label
+                source = '<span class="muted-src">%s</span>' % esc(label)
             rows.append(
                 '<div class="arrival"><div class="left">%s <span class="route">№%s</span></div>'
                 '<div class="right">%s<span class="src">%s</span></div></div>' % (
@@ -459,7 +477,7 @@ def render_forecast(fc: Dict[str, Any]) -> str:
         if reason:
             rows.append('<p class="empty">%s</p>' % esc(reason))
         else:
-            rows.append('<p class="empty">Сейчас машин в эфире нет — попробуйте обновить.</p>')
+            rows.append('<p class="empty">Сейчас ближайших проездов нет — попробуйте обновить.</p>')
     return "".join(rows)
 
 
@@ -520,9 +538,6 @@ def page(config: Dict[str, Any], saved: bool, errors: List[str],
     status_ok = status == "active"
     rows = render_forecast(fc)
 
-    chips = "".join(
-        '<button type="button" data-min="%d">%d</button>' % (m, m) for m in CHIPS)
-
     err_html = ""
     if errors:
         err_html = '<div class="banner error"><strong>Проверьте настройки:</strong><ul>%s</ul></div>' % (
@@ -542,9 +557,10 @@ def page(config: Dict[str, Any], saved: bool, errors: List[str],
 
     raw_notify = values.get("notify_at")
     if isinstance(raw_notify, (list, tuple)):
-        notify_value = ",".join(str(x) for x in raw_notify)
+        notify_value = str(raw_notify[0]) if raw_notify else "10"
     else:
-        notify_value = str(raw_notify or "")
+        parts = [p for p in re.split(r"[,\s;]+", str(raw_notify or "")) if p]
+        notify_value = parts[0] if parts else str(config.get("notify_at", [10])[0] if isinstance(config.get("notify_at"), list) and config.get("notify_at") else 10)
     weekdays_val = values.get("weekdays_only", config.get("weekdays_only", False))
     if isinstance(weekdays_val, str):
         weekdays_val = weekdays_val.strip().lower() in ("1", "true", "yes", "on")
@@ -565,11 +581,13 @@ def page(config: Dict[str, Any], saved: bool, errors: List[str],
         repeat_val = 1
     rep_sel = {v: ('selected' if repeat_val == v else '') for v in (1,2,3,5,10)}
 
-    notify_mode_val = str(values.get("notify_mode", config.get("notify_mode", "repeat")) or "repeat").strip().lower()
-    if notify_mode_val not in ("repeat", "once"):
-        notify_mode_val = "repeat"
-    mode_repeat_sel = 'selected' if notify_mode_val == 'repeat' else ''
-    mode_once_sel = 'selected' if notify_mode_val == 'once' else ''
+    notify_mode_val = str(values.get("notify_mode", config.get("notify_mode", "every")) or "every").strip().lower()
+    if notify_mode_val in ("lead", "once", "advance"):
+        notify_mode_val = "lead"
+    else:
+        notify_mode_val = "every"
+    mode_lead_sel = 'selected' if notify_mode_val == 'lead' else ''
+    mode_every_sel = 'selected' if notify_mode_val == 'every' else ''
 
     rs_val = values.get("route_settings", config.get("route_settings", {}))
     if isinstance(rs_val, str):
@@ -651,13 +669,9 @@ footer{color:var(--muted);font-size:13px;text-align:center;margin-top:8px}
   <div class="card-head"><h2>Сейчас на остановке</h2><a href="#" id="refresh-btn">Обновить</a></div>
   <div id="forecast">%s</div>
   <p class="hint">Показаны только маршруты: %s. Остальные маршруты остановки скрыты.<br>
-     «прогноз» — время по данным Яндекса, «без GPS» — машины ещё нет на карте (Яндекс считает по расписанию).</p>
+     Для каждого проезда показывается время и направление движения (куда поедет) — ЮЗР или НЮР. Если направление не определено, время всё равно показывается, но без угадывания стороны. «В эфире» — есть GPS, «прогноз Яндекса, без GPS» — время по прогнозу/расписанию.</p>
 </section>
-<section class="card" id="observability-card">
-  <div class="card-head"><h2>Наблюдаемость и антиспам</h2></div>
-  %s
-  <p class="hint">Статус берётся из снимка, который пишет трекер (`last_arrivals.json`). Обновляется вместе с прогнозом.</p>
-</section>
+
 <form method="post" action="save">
   <input type="hidden" name="csrf" value="%s">
   <section class="card">
@@ -668,37 +682,22 @@ footer{color:var(--muted);font-size:13px;text-align:center;margin-top:8px}
     </div>
     <label class="check"><input type="checkbox" name="weekdays_only" value="1" %s> Не следить по выходным (сб, вс)</label>
     <p class="hint">Время чебоксарское. Можно задать окно через полночь, например 22:00–07:00.</p>
-    <label for="window_by_weekday">Окна по дням недели (JSON, необязательно)</label>
-    <textarea id="window_by_weekday" name="window_by_weekday" spellcheck="false" placeholder='{"1": ["08:30", "09:10"], "5": ["08:30", "09:10"]}'>%s</textarea>
-    <p class="hint">Необязательно. Окно слежения по конкретным дням недели вместо общего. Ключи — номера дней недели (0=пн … 6=вс) или названия (mon, tue, wed…). Значение — массив [с, до] в формате ЧЧ:ММ. Оставьте пустым — будет общее окно.</p>
+    <input type="hidden" name="window_by_weekday" value="%s">
   </section>
   <section class="card">
     <h2>Уведомления</h2>
-    <label for="notify_at">За сколько минут до прихода</label>
-    <input type="text" id="notify_at" name="notify_at" value="%s" inputmode="numeric" autocomplete="off" required>
-    <div class="chips" id="chips">%s</div>
-    <p class="hint">Можно любые значения через запятую, например 20,15,10,5,2.</p>
-    <label for="notify_mode">Режим уведомлений (антиспам)</label>
+    <label for="notify_mode">Как уведомлять</label>
     <select id="notify_mode" name="notify_mode">
-      <option value="repeat" %s>Повторять, пока маршрутка в зоне порогов</option>
-      <option value="once" %s>Один раз на каждый порог (для одной поездки)</option>
+      <option value="lead" %s>Один раз — за N минут до приезда</option>
+      <option value="every" %s>Каждые N минут, пока маршрутка едет</option>
     </select>
-    <p class="hint">«Один раз на порог» уменьшает спам: для одного и того же автобуса пороги 15, 10, 5 и т.д. сработают по одному разу. «Повторять» использует интервал повтора ниже.</p>
-    <label for="notify_repeat_minutes">Как часто повторять уведомления</label>
-    <select id="notify_repeat_minutes" name="notify_repeat_minutes">
-      <option value="1" %s>Каждую минуту (каждый опрос)</option>
-      <option value="2" %s>Каждые 2 минуты</option>
-      <option value="3" %s>Каждые 3 минуты</option>
-      <option value="5" %s>Каждые 5 минут</option>
-      <option value="10" %s>Каждые 10 минут</option>
-    </select>
-    <p class="hint">В режиме «повторять» повторное уведомление об том же автобусе придёт не раньше чем через выбранный интервал.</p>
-    <details>
-      <summary>Разные пороги по маршрутам (JSON)</summary>
-      <label for="route_settings">Переопределения для маршрутов</label>
-      <textarea id="route_settings" name="route_settings" spellcheck="false" placeholder='{"5":{"notify_at":[20,15,10,5],"notify_mode":"once","notify_repeat_minutes":2,"walk_minutes":3}}'>%s</textarea>
-      <p class="hint">Необязательно. Позволяет задать свои пороги/режим/повтор/«пора выходить» для конкретного маршрута. Оставьте пустым, чтобы использовать общие настройки.</p>
-    </details>
+    <label for="notify_at">За сколько минут до приезда</label>
+    <input type="number" id="notify_at" name="notify_at" value="%s" min="0" max="180" step="1" required>
+    <p class="hint">В режиме «один раз» — когда прислать уведомление. В режиме «каждые N минут» — за сколько минут начать напоминания.</p>
+    <label for="notify_repeat_minutes">Повторять каждые, минут</label>
+    <input type="number" id="notify_repeat_minutes" name="notify_repeat_minutes" value="%s" min="1" max="60" step="1" required>
+    <p class="hint">Используется в режиме «каждые N минут» (например, 1 — каждую минуту, 5 — каждые 5 минут).</p>
+    <input type="hidden" name="route_settings" value="%s">
     <label for="walk_minutes">«Пора выходить» — за сколько минут</label>
     <input type="number" id="walk_minutes" name="walk_minutes" min="0" max="120" step="1" value="%s">
     <p class="hint">0 — выключено. Если маршрутка будет раньше этого времени, в пуше появится «⏰ Пора выходить!».</p>
@@ -753,8 +752,16 @@ footer{color:var(--muted);font-size:13px;text-align:center;margin-top:8px}
       (d.rows&&d.rows.length?' — показаны данные прошлого опроса':'')+'</p>'}
     if(d.rows&&d.rows.length){
       d.rows.forEach(function(r){
-        var detail=[r.side,r.dest].filter(Boolean).join(' · ');
-        var src=r.live?esc(r.source):'<span class="muted-src">'+esc(r.source)+', без GPS</span>';
+        var direction=r.travel_dir||r.dest||'направление уточняется';
+        var fromSide=r.from_side||r.side||'';
+        var detail=[direction,fromSide].filter(Boolean).join(' · ');
+        var src;
+        if(r.live){src=esc(r.source||'в эфире');}
+        else{
+          var label=r.source||'прогноз Яндекса';
+          if(label.indexOf('без GPS')===-1){label=label+', без GPS';}
+          src='<span class="muted-src">'+esc(label)+'</span>';
+        }
         out+='<div class="arrival"><div class="left"><span class="mins">'+esc(r.mins)+
           '</span> <span class="when">в '+esc(r.when)+'</span> <span class="route">№'+esc(r.route)+
           '</span></div><div class="right">'+
@@ -796,16 +803,14 @@ footer{color:var(--muted);font-size:13px;text-align:center;margin-top:8px}
         ok_html + err_html + test_html,
         "".join(rows),
         esc(", ".join(str(x) for x in (config.get("routes") or ["5"]))),
-        obs_html,
         esc(token),
         esc(values.get("window_from") or config.get("window_from") or "05:30"),
         esc(values.get("window_to") or config.get("window_to") or "10:00"),
         weekdays_checked,
         esc(wd_text),
+        mode_lead_sel, mode_every_sel,
         esc(notify_value),
-        chips,
-        mode_repeat_sel, mode_once_sel,
-        rep_sel[1], rep_sel[2], rep_sel[3], rep_sel[5], rep_sel[10],
+        esc(str(repeat_val)),
         esc(route_settings_text),
         esc(values.get("walk_minutes", config.get("walk_minutes", 0))),
         esc(values.get("interval", config.get("interval", 60))),

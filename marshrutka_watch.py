@@ -298,23 +298,24 @@ class RouteGeometry:
         return total / len(positions)
 
     def approach(self, occ: StopOnRoute, min_back_m: float = 700.0) -> Tuple[str, str]:
-        """Откуда подъезжает машина: остановка-ориентир и направление.
+        """Откуда подъезжает машина и куда поедет после остановки.
 
-        У кольцевого маршрута остановку проходят дважды, и первые метры
-        трассы у проходов совпадают. Ориентир ищем по ветке, характерной
-        именно для этого прохода: одна ветка идёт от Пригородного вокзала
-        (ЮЗР), другая — от Лакреевского леса (НЮР).
+        Возвращает (ориентир_откуда, направление_куда). Для кольцевого маршрута
+        ориентир ищем по ветке, характерной для конкретного прохода.
         """
         chain = self.back_chain(occ, max_back_m=max(min_back_m * 3.0, 2000.0))
         if not chain:
             return "", ""
+        next_stop = self.dest_after(occ)
         for keyword in SIDE_KEYWORDS:
             for st in chain:
                 if keyword in st.name.lower():
-                    direction = direction_label("со стороны «%s»" % st.name) or ""
-                    return st.name, direction
-        name = chain[0].name
-        return name, direction_label("со стороны «%s»" % name) or ""
+                    side_name = st.name
+                    direction = direction_label("со стороны «%s»" % side_name, next_stop) or ""
+                    return side_name, direction
+        side_name = chain[0].name
+        direction = direction_label("со стороны «%s»" % side_name, next_stop) or ""
+        return side_name, direction
 
     def dest_after(self, occ: StopOnRoute) -> str:
         """Куда машина едет дальше (следующая остановка с другим названием)."""
@@ -517,7 +518,7 @@ class Tracker:
                         route=route, kind=kind, ts=ts,
                         source="Estimated" if est else "Scheduled",
                         vehicle_id=ev.get("vehicleId"),
-                        dest=dest,
+                        dest=None,  # направление определим отдельно; thread destination на кольце вводит в заблуждение
                     ))
         out.sort(key=lambda a: a.ts)
         return out
@@ -630,9 +631,13 @@ class Tracker:
             log("не удалось взять геометрию маршрута %s: %s" % (route, exc), "WARN")
             return None
 
-    # -- определение стороны ----------------------------------------------
+    # -- определение направления ------------------------------------------
     def enrich(self, arrivals: List[Arrival]) -> List[Arrival]:
-        """Дополняет прогноз направлением (с какой стороны подъедет)."""
+        """Дополняет прогноз направлением движения (куда поедет после остановки).
+
+        Правило: если направление нельзя определить уверенно, прибытие всё равно
+        показывается/отправляется с временем, но без угадывания стороны.
+        """
         if not arrivals:
             return arrivals
         by_route: Dict[str, List[Arrival]] = {}
@@ -642,13 +647,26 @@ class Tracker:
         for route, arrs in by_route.items():
             geo = self.geometry(route)
             if geo is None:
+                self._clear_direction(arrs)
                 continue
             occ = geo.occurrences(self.yandex.stop_name)
             if not occ:
                 # остановка может называться иначе, чем в стейте маршрута
                 occ = [o for o in geo.stops if _similar(o.name, self.yandex.stop_name)]
             if not occ:
+                self._clear_direction(arrs)
                 continue
+
+            branch_labels = {}
+            for o in occ:
+                from_side, travel_dir = geo.approach(o, self.cfg.side_min_back_m)
+                branch_labels[o.arc] = {
+                    "occ": o,
+                    "from_side": ("со стороны «%s»" % from_side) if from_side else "",
+                    "travel_dir": travel_dir or "",
+                    "next_stop": geo.dest_after(o),
+                }
+
             line_ids = self._line_ids(route)
             vehicles = self.vehicles(line_ids, arrs[0].kind if arrs else "")
             info = self._vehicle_positions(geo, occ, vehicles)
@@ -657,71 +675,64 @@ class Tracker:
             used_v: set = set()
             for a in arrs:
                 if a.vehicle_id and a.vehicle_id in info:
-                    v = info[a.vehicle_id]
-                    a.side = v["side"]
-                    a.next_stop = v["next_stop"]
-                    a.dest = v.get("dest") or (
-                        "в сторону «%s»" % v["next_stop"] if v.get("next_stop") else None)
-                    a.origin = "yandex+geo"
-                    a.live = True
+                    self._apply_branch(a, info[a.vehicle_id], branch_labels, live=True)
                     used_v.add(a.vehicle_id)
 
-            # 2) остальные — подбираем по времени прибытия
-            pairs: List[Tuple[float, int, str]] = []
+            # 2) сопоставление по времени — только когда есть один явный кандидат
             for ai, a in enumerate(arrs):
-                if a.side:
+                if a.dest or a.side:
                     continue
+                candidates = []
                 for vid, v in info.items():
                     if vid in used_v:
                         continue
-                    pairs.append((abs(v["eta_ts"] - a.ts), ai, vid))
-            pairs.sort(key=lambda x: x[0])
-            taken_a: set = set()
-            for dt, ai, vid in pairs:
-                if ai in taken_a or vid in used_v:
+                    dt = abs(v["eta_ts"] - a.ts)
+                    candidates.append((dt, vid, v))
+                if not candidates:
                     continue
-                a = arrs[ai]
-                tol = max(self.cfg.match_tolerance_min, 0.3 * max(1.0, abs(a.minutes)))
-                if dt > tol * 60.0:
+                candidates.sort(key=lambda x: x[0])
+                best_dt, best_vid, best_v = candidates[0]
+                tol = max(self.cfg.match_tolerance_min, 0.3 * max(1.0, abs(a.minutes))) * 60.0
+                if best_dt > tol:
                     continue
-                taken_a.add(ai)
-                used_v.add(vid)
-                v = info[vid]
-                a.side = v["side"]
-                a.next_stop = v["next_stop"]
-                a.dest = v.get("dest") or (
-                    "в сторону «%s»" % v["next_stop"] if v.get("next_stop") else None)
-                a.origin = "yandex+geo"
-                a.live = True
+                # не угадываем, если есть другой близкий кандидат на другой проход
+                ambiguous = False
+                if len(candidates) > 1:
+                    second_dt, _, second_v = candidates[1]
+                    if second_v.get("occ_arc") != best_v.get("occ_arc") and (second_dt - best_dt) < 90.0:
+                        ambiguous = True
+                if ambiguous:
+                    continue
+                self._apply_branch(a, best_v, branch_labels, live=True)
+                used_v.add(best_vid)
 
-            # 3) логика исключения. Если ни одна видимая машина не объясняет это
-            #    прибытие, а все видимые машины едут к одному из проходов —
-            #    значит прибытие с другого прохода (с другой стороны улицы).
-            #    Важно: "едут к проходу" = есть машина, спроецированная на этот
-            #    проход, независимо от её ETA (ETA может сильно отличаться от
-            #    прогноза по остановке для другой машины).
-            if len(occ) > 1 and info:
-                occupied = {v["occ_arc"] for v in info.values() if v.get("occ_arc") is not None}
-                if len(occupied) == 1:
-                    other = [o for o in occ if o.arc not in occupied]
-                    if len(other) == 1:
-                        for a in arrs:
-                            if a.side:
-                                continue
-                            side_name, direction = geo.approach(other[0], self.cfg.side_min_back_m)
-                            a.side = ("со стороны «%s»" % side_name) if side_name else ""
-                            a.next_stop = geo.dest_after(other[0])
-                            a.dest = direction or (
-                                "в сторону «%s»" % a.next_stop if a.next_stop else None)
-                            a.origin = "yandex+geo"
-
-            # если сторону/направление определить не удалось — не показываем
-            # конечную маршрута из треда: на кольцевом маршруте она одинаковая
-            # в обе стороны и вводит в заблуждение
+            # направление не определено уверенно — оставляем время, но не угадываем
             for a in arrs:
-                if not a.side:
-                    a.dest = None
+                if not (a.dest and a.dest.startswith("в сторону ")):
+                    self._clear_direction([a])
         return arrivals
+
+    def _apply_branch(self, arrival: Arrival, veh_info: Dict[str, Any],
+                      branch_labels: Dict[float, Dict[str, Any]], live: bool) -> None:
+        lbl = branch_labels.get(veh_info.get("occ_arc")) or {}
+        arrival.side = lbl.get("from_side") or veh_info.get("side") or ""
+        arrival.dest = lbl.get("travel_dir") or veh_info.get("dest") or ""
+        arrival.next_stop = lbl.get("next_stop") or veh_info.get("next_stop")
+        if live:
+            arrival.origin = "yandex+geo"
+            arrival.live = True
+
+    def _clear_direction(self, arrivals: List[Arrival]) -> None:
+        for a in arrivals:
+            # конечная из треда/расписания на кольце не равна "куда поедет после остановки"
+            a.side = a.side or ""
+            a.dest = a.dest or ""
+            # если это не наше нормализованное направление, не оставляем мусор
+            if a.dest and not a.dest.startswith("в сторону "):
+                a.dest = ""
+            if a.side and not a.side.startswith("со стороны "):
+                # side должен быть ориентиром "со стороны ..."; иначе очищаем
+                a.side = ""
 
     def _line_ids(self, route: str) -> List[str]:
         state = self.yandex.stop_state()
@@ -855,37 +866,19 @@ class Tracker:
             arrivals = self.enrich(arrivals)
         except Exception as exc:  # noqa: BLE001
             # запасной источник: показываем последний удачный прогноз, а не пустоту.
-            # Панель/уведомления должны знать, что данные не свежие (source: «расписание»).
             if self._last_arrivals:
                 self.last_error = str(exc)
-                return list(self._last_arrivals)
+                cached = list(self._last_arrivals)
+                # при использовании кэша не утверждаем "живость", но сохраняем время/направление
+                for a in cached:
+                    if a.source == "Estimated":
+                        a.source = "Scheduled"
+                    a.live = False
+                return cached
             raise
         arrivals = [a for a in arrivals if a.ts > time.time() - 120]
         self._last_arrivals = list(arrivals)
         self.last_error = None
-        # живые машины: если видимые машины есть, но парырование с расписанием
-        # не дало live-информацию — заполняем прибытия из живых ETA (как на карте)
-        for route in (self.cfg.routes or []):
-            r = str(route)
-            kind = ""
-            for a in arrivals:
-                if a.route == r and a.kind:
-                    kind = a.kind
-                    break
-            live_list = self._live_arrivals(kind, r)
-            if not live_list:
-                continue
-            tol_s = max(self.cfg.match_tolerance_min, 0.3) * 60.0
-            for a in sorted((x for x in arrivals if x.route == r and not x.live), key=lambda x: x.ts):
-                best = min(live_list, key=lambda l: abs(l.ts - a.ts))
-                if abs(best.ts - a.ts) <= tol_s:
-                    a.live = True
-                    a.vehicle_id = best.vehicle_id
-                    a.source = "Estimated"
-                    a.side = best.side
-                    a.dest = best.dest
-                    a.next_stop = best.next_stop
-                    a.origin = "yandex+geo"
         return arrivals
 
 
@@ -909,7 +902,7 @@ def _thread_destination(thread: Dict[str, Any]) -> Optional[str]:
 
 
 # Ориентиры, по которым узнаём ветку кольцевого маршрута №5.
-# Проверяются по порядку: первое совпадение и определяет сторону.
+# Проверяются по порядку: первое совпадение и определяет проход/направление.
 SIDE_KEYWORDS = ("пригородный автовокзал", "лакреевский лес", "ярмарка",
                  "госархив", "улица гладкова", "тк центральный")
 
@@ -918,22 +911,24 @@ SHARED_CHAIN_STOPS = 2
 
 
 def direction_label(side: Optional[str], next_stop: Optional[str] = None) -> Optional[str]:
-    """Человекочитаемое направление движения №5 от «Медицинского центра».
+    """Куда поедет маршрутка после остановки (направление движения).
 
-    «Со стороны …» — это откуда подъехала машина (предыдущая заметная остановка).
+    Для кольцевого №5 в Чебоксарах на «Медицинском центре» важны два прохода:
+    - подъезд со стороны Пригородного автовокзала/Госархива -> в сторону ЮЗР
+    - подъезд со стороны Лакреевского леса/Ярмарки -> в сторону НЮР
     """
     s = (side or "").lower()
     n = (next_stop or "").lower()
-    # едет со стороны пригородного вокзала/Госархива -> в сторону ЮЗР
-    if "пригород" in s or "вокзал" in s or "госархив" in s:
+    # едет со стороны Пригородного автовокзала/Госархива -> дальше в сторону ЮЗР
+    if "пригород" in s or "автовокзал" in s or "госархив" in s:
         return "в сторону ЮЗР"
-    # едет со стороны Лакреевского леса/Ярмарки -> в сторону НЮР
+    # едет со стороны Лакреевского леса/Ярмарки -> дальше в сторону НЮР
     if "лакре" in s or "ярмар" in s:
         return "в сторону НЮР"
     # запасной вариант: по следующей остановке после Медцентра
-    if "лакре" in n or "ярмар" in n or "центральн" in n:
+    if "лакре" in n or "ярмар" in n or "центральн" in n or "гладков" in n:
         return "в сторону ЮЗР"
-    if "пригород" in n or "вокзал" in n or "таможн" in n:
+    if "пригород" in n or "автовокзал" in n or "таможн" in n or "бичурин" in n:
         return "в сторону НЮР"
     return None
 
@@ -1174,7 +1169,12 @@ def normalize(cfg: Config) -> None:
     if cfg.notify_repeat_minutes > 180:
         cfg.notify_repeat_minutes = 180
     mode = str(getattr(cfg, "notify_mode", "repeat") or "repeat").strip().lower()
-    cfg.notify_mode = mode if mode in ("repeat", "once") else "repeat"
+    if mode in ("lead", "once", "advance"):
+        cfg.notify_mode = "lead"
+    elif mode in ("every", "repeat", "periodic"):
+        cfg.notify_mode = "every"
+    else:
+        cfg.notify_mode = "every"
     rs = getattr(cfg, "route_settings", None)
     if not isinstance(rs, dict):
         cfg.route_settings = {}
@@ -1201,8 +1201,10 @@ def normalize(cfg: Config) -> None:
                     pass
             if "notify_mode" in rv:
                 m = str(rv.get("notify_mode") or "").strip().lower()
-                if m in ("repeat", "once"):
-                    item["notify_mode"] = m
+                if m in ("lead", "once", "advance"):
+                    item["notify_mode"] = "lead"
+                elif m in ("every", "repeat", "periodic"):
+                    item["notify_mode"] = "every"
             if item:
                 clean[str(rk)] = item
         cfg.route_settings = clean
@@ -1256,10 +1258,13 @@ def write_snapshot(path: str, arrivals: List[Arrival], tz_offset: Optional[int],
             "ts": a.ts,
             "when": city_time(a.ts, tz_offset).strftime("%H:%M"),
             "mins": max(0, int(round(a.minutes))),
-            "side": a.side or "",
-            "dest": a.dest or "",
+            "side": a.side or "",          # откуда подъедет
+            "dest": a.dest or "",          # куда поедет
+            "travel_dir": a.dest or "",
+            "from_side": a.side or "",
+            "direction_known": bool(a.dest),
             "live": bool(a.live),
-            "source": "прогноз" if a.source == "Estimated" else "расписание",
+            "source": "в эфире" if a.live else "прогноз Яндекса",
         })
     payload = {
         "kind": "marshrutka-watch/1",
@@ -1336,7 +1341,13 @@ class Notifier:
         except Exception:
             base["notify_repeat_minutes"] = 1
         mode = str(base.get("notify_mode") or "repeat").strip().lower()
-        base["notify_mode"] = mode if mode in ("repeat", "once") else "repeat"
+        if mode in ("lead", "once", "advance"):
+            mode = "lead"
+        elif mode in ("every", "repeat", "periodic"):
+            mode = "every"
+        else:
+            mode = "every"
+        base["notify_mode"] = mode
         try:
             base["walk_minutes"] = max(0, min(120, int(base.get("walk_minutes") or 0)))
         except Exception:
@@ -1387,39 +1398,40 @@ class Notifier:
 
             eff = self._effective(route)
             notify_at = eff["notify_at"]
-            limit = max(notify_at) if notify_at else 20
-            if mins > limit or mins < -1:
-                self.last_skip_reason = "вне порогов (%s мин)" % int(round(mins))
+            mode = eff.get("notify_mode") or "every"
+            # "за N минут до приезда" — используем первое (максимальное) значение как целевой порог
+            lead = max(notify_at) if notify_at else 10
+            if mode == "lead":
+                limit = lead
+                if mins > limit or mins < -1:
+                    self.last_skip_reason = "вне порога (%s мин)" % int(round(mins))
+                    self._record_event({"type": "skip", "route": route, "reason": "out_of_range", "mins": int(round(mins))})
+                    continue
+                done = self.notified_thresholds.setdefault(route, set())
+                if lead in done:
+                    self.last_skip_reason = "уведомление за %s мин уже отправлено" % lead
+                    self._record_event({"type": "skip", "route": route, "reason": "once_done", "mins": int(round(mins)), "thresholds": [lead]})
+                    continue
+                done.add(lead)
+                self.last_skip_reason = ""
+                self._send(arr, mins, lead, eff)
+                continue
+
+            # "каждые N минут" — напоминаем периодически, пока маршрутка в пределах горизонта
+            horizon = lead
+            if mins > horizon or mins < -1:
+                self.last_skip_reason = "вне горизонта (%s мин)" % int(round(mins))
                 self._record_event({"type": "skip", "route": route, "reason": "out_of_range", "mins": int(round(mins))})
                 continue
-            crossed = [t for t in notify_at if mins <= t]
-            if not crossed:
-                self.last_skip_reason = "пороги не достигнуты"
-                continue
-            threshold = min(crossed)
-
-            mode = eff.get("notify_mode") or "repeat"
-            if mode == "once":
-                done = self.notified_thresholds.setdefault(route, set())
-                new_hits = [t for t in crossed if t not in done]
-                if not new_hits:
-                    self.last_skip_reason = "антиспам: пороги уже отправлены (%s)" % ",".join(str(x) for x in sorted(done, reverse=True))
-                    self._record_event({"type": "skip", "route": route, "reason": "once_done", "mins": int(round(mins)), "thresholds": sorted(list(done), reverse=True)})
-                    continue
-                fire_threshold = min(new_hits)
-                done.update(new_hits)
-                self.last_skip_reason = ""
-                self._send(arr, mins, fire_threshold, eff)
-                continue
-
             repeat = int(eff.get("notify_repeat_minutes") or 1)
             if repeat < 1:
                 repeat = 1
             last_ts = self.last_notify_ts.get(route)
             if last_ts is not None and (now_ts - last_ts) < repeat * 60 - 5:
-                self.last_skip_reason = "антиспам: повтор не раньше чем через %s мин" % repeat
+                self.last_skip_reason = "повтор не раньше чем через %s мин" % repeat
                 self._record_event({"type": "skip", "route": route, "reason": "throttle", "mins": int(round(mins)), "repeat": repeat})
                 continue
+            threshold = min([t for t in notify_at if mins <= t] or [horizon])
             self.last_skip_reason = ""
             self.last_notify_ts[route] = now_ts
             self._send(arr, mins, threshold, eff)
@@ -1429,22 +1441,36 @@ class Notifier:
             eff = self._effective(arr.route)
         tz = getattr(self.tz_source, "tz_offset", None)
         when = city_time(arr.ts, tz).strftime("%H:%M")
-        title = "Маршрутка %s — через %d мин" % (arr.route, max(0, round(mins)))
-        body_lines = ["Прибудет на остановку «%s» в %s (через %d мин)." % (
-            self.stop_name, when, max(0, round(mins)))]
-        if arr.side and arr.dest:
-            body_lines.append("Едет %s, %s." % (arr.side, arr.dest))
-        elif arr.side:
-            body_lines.append("Едет %s." % arr.side)
-        elif arr.dest:
-            body_lines.append(arr.dest[0].upper() + arr.dest[1:] + ".")
-        if not arr.live:
-            # машины нет в эфире — время посчитано Яндексом по расписанию
-            body_lines.append("Время ориентировочное: машины пока нет на карте.")
+        eta_min = max(0, int(round(mins)))
+        dir_label = arr.dest or ""  # куда поедет
+        if dir_label:
+            title = "Маршрутка %s %s — через %d мин" % (arr.route, dir_label, eta_min)
+        else:
+            title = "Маршрутка %s — через %d мин" % (arr.route, eta_min)
+
+        body_lines = ["Остановка «%s»: прибытие в %s (через %d мин)." % (
+            self.stop_name, when, eta_min)]
+        if dir_label:
+            if arr.side:
+                body_lines.append("Поедет %s (%s)." % (dir_label, arr.side))
+            else:
+                body_lines.append("Поедет %s." % dir_label)
+        else:
+            body_lines.append("Направление движения пока уточняется.")
+
+        if arr.live:
+            body_lines.append("Источник: в эфире (GPS).")
+        else:
+            body_lines.append("Источник: прогноз Яндекса, машины в эфире сейчас может не быть.")
+
         walk_minutes = int(eff.get("walk_minutes", 0) or 0)
         if walk_minutes and mins <= walk_minutes:
             body_lines.append("⏰ Пора выходить!")
-            title = "Маршрутка %s — %d мин, пора выходить" % (arr.route, max(0, round(mins)))
+            if dir_label:
+                title = "Маршрутка %s %s — %d мин, пора выходить" % (arr.route, dir_label, eta_min)
+            else:
+                title = "Маршрутка %s — %d мин, пора выходить" % (arr.route, eta_min)
+
         body = "\n".join(body_lines)
         priority = "high" if threshold <= 5 else "default"
         log("уведомление: %s | %s" % (title, body.replace("\n", " / ")))
@@ -1454,10 +1480,12 @@ class Notifier:
         event = {
             "ts": time.time(),
             "route": arr.route,
-            "mins": max(0, int(round(mins))),
+            "mins": eta_min,
             "when": when,
             "threshold": threshold,
             "mode": eff.get("notify_mode"),
+            "direction": dir_label,
+            "from_side": arr.side or "",
             "title": title,
             "ok": bool(ok),
         }
@@ -1529,9 +1557,12 @@ def cmd_selftest(cfg: Config) -> int:
     arrivals = tr.enrich(arrivals)
     now = time.time()
     for a in arrivals:
-        print("  %-4s %s  через %5.1f мин  %-10s %-26s %-22s %s" % (
+        direction = a.dest or "направление уточняется"
+        where_from = a.side or "-"
+        src = "в эфире" if a.live else "прогноз Яндекса"
+        print("  %-4s %s  через %5.1f мин  %-22s %-34s %-14s %s" % (
             a.route, city_time(a.ts, y.tz_offset).strftime("%H:%M"), a.minutes,
-            a.source, a.side or "-", a.dest or "-", a.vehicle_id or ""))
+            direction, where_from, src, a.vehicle_id or ""))
     print()
     print("--- геометрия ---")
     for route in cfg.routes:
@@ -1567,10 +1598,16 @@ def cmd_once(cfg: Config) -> int:
     print("Сейчас в городе: %s" % now.strftime("%Y-%m-%d %H:%M"))
     print("Остановка: %s" % tr.yandex.stop_name)
     print()
+    if not arrivals:
+        print("  ближайших проездов не найдено")
     for a in arrivals:
-        print("  маршрут %-4s %s (через %4.1f мин) %-10s %-26s %s" % (
-            a.route, city_time(a.ts, tr.yandex.tz_offset).strftime("%H:%M"), a.minutes,
-            a.source, a.side or "-", a.dest or ""))
+        when = city_time(a.ts, tr.yandex.tz_offset).strftime("%H:%M")
+        mins = max(0, int(round(a.minutes)))
+        direction = a.dest or "направление уточняется"
+        where_from = (" (%s)" % a.side) if a.side else ""
+        src = "в эфире" if a.live else "прогноз Яндекса"
+        print("  №%-4s  %s  через %2d мин  %-22s%s  [%s]" % (
+            a.route, when, mins, direction, where_from, src))
     if cfg.test_notify:
         notif.test()
     return 0
