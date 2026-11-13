@@ -709,6 +709,24 @@ class Tracker:
                 self._apply_branch(a, best_v, branch_labels, live=True)
                 used_v.add(best_vid)
 
+            # fallback: если id прогноза и живой машины расходятся, но по времени
+            # видна конкретная живая машина на конкретном проходе — берём направление от неё
+            for a in arrs:
+                if a.dest and a.dest.startswith("в сторону "):
+                    continue
+                candidates = [(abs(v["eta_ts"] - a.ts), v) for v in info.values()]
+                if not candidates:
+                    continue
+                candidates.sort(key=lambda x: x[0])
+                best_dt, best_v = candidates[0]
+                tol = max(self.cfg.match_tolerance_min, 0.3 * max(1.0, abs(a.minutes))) * 60.0
+                if best_dt > tol:
+                    continue
+                if len(candidates) > 1 and (candidates[1][0] - best_dt) < 90.0:
+                    if candidates[1][1].get("occ_arc") != best_v.get("occ_arc"):
+                        continue
+                self._apply_branch(a, best_v, branch_labels, live=True)
+
             # направление не определено уверенно — пробуем восстановить ранее известное для этого рейса
             for a in arrs:
                 if a.dest and a.dest.startswith("в сторону "):
